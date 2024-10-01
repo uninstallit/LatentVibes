@@ -79,35 +79,13 @@ word_decoder = keras.Model(
 word_decoder.summary()
 
 
-# # Score function
-# xt_inputs = keras.Input(shape=(latent_dim,), name="xt_input")
-# time_inputs = keras.Input(shape=(1,), name="time_input")
-
-# # Time embedding
-# time_embedding = layers.Embedding(
-#     input_dim=maxlen, output_dim=embedding_dim, input_length=1
-# )(time_inputs)
-# time_embedding = layers.Flatten()(time_embedding)
-
-# x = layers.concatenate([xt_inputs, time_embedding])
-# x = layers.Dense(32, activation="relu")(x)
-# x = layers.Dense(64, activation="relu")(x)
-
-# score_output = layers.Dense(
-#     latent_dim, activation="linear", name="log_gradient_output"
-# )(x)
-# score_model = keras.Model(
-#     inputs=[xt_inputs, time_inputs], outputs=score_output, name="score_model"
-# )
-# score_model.summary()
-
-
 # Score function
 xt_inputs = keras.Input(shape=(maxlen, latent_dim), name="xt_input")
 time_inputs = keras.Input(shape=(1,), name="time_input")  # Shape: (1,)
 
 time_inputs_expanded = layers.RepeatVector(maxlen)(time_inputs)
 x = layers.concatenate([xt_inputs, time_inputs_expanded], axis=-1)
+x = layers.TimeDistributed(layers.Dense(64, activation="relu"))(x)
 x = layers.Flatten()(x)
 
 x = layers.Dense(128, activation="relu")(x)
@@ -158,15 +136,16 @@ class VAE(keras.Model):
 
     def apply_word_encoder(self, inputs):
         word_element, time_index = inputs
-        time_index = tf.reshape(time_index, [])
+        word_element = tf.expand_dims(word_element, axis=-1)  # Shape: (batch_size, 1)
         time_index = tf.fill([self.batch_size], time_index)
+        time_index = tf.expand_dims(time_index, axis=-1)  # Shape: (batch_size, 1)
         z_mean, z_log_var, z = self.word_encoder([word_element, time_index])
         return z_mean, z_log_var, z
 
     def apply_word_decoder(self, inputs):
         z_element, time_index = inputs
-        time_index = tf.reshape(time_index, [])
         time_index = tf.fill([self.batch_size], time_index)
+        time_index = tf.expand_dims(time_index, axis=-1)  # Shape: (batch_size, 1)
         reconstruction = self.word_decoder([z_element, time_index])
         return reconstruction
 
@@ -303,17 +282,14 @@ class VAE(keras.Model):
             z = tf.transpose(z, perm=[1, 0, 2])
 
             reconstruction = tf.transpose(tf.squeeze(reconstruction, axis=-1))
-            reconstruction_loss = ops.mean(
-                ops.sum(
-                    keras.losses.mean_absolute_error(data, reconstruction),
-                    axis=-1,
-                )
-            )
 
-            kl_loss = -0.5 * ops.sum(
-                1 + z_log_var - ops.square(z_mean) - ops.exp(z_log_var), axis=-1
+            reconstruction_loss = keras.losses.mean_absolute_error(data, reconstruction)
+            reconstruction_loss = tf.reduce_mean(reconstruction_loss)
+
+            kl_loss = -0.5 * tf.reduce_sum(
+                1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=-1
             )
-            kl_loss = ops.mean(kl_loss)
+            kl_loss = tf.reduce_mean(kl_loss)
 
             ez_log_var = tf.math.exp(z_log_var)
             sequence, score_error = self.diffusion_loss(z_mean, ez_log_var)
