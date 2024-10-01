@@ -2,7 +2,6 @@ import os
 
 os.environ["KERAS_BACKEND"] = "tensorflow"
 
-# import numpy as np
 import tensorflow as tf
 import keras
 from keras import ops
@@ -62,7 +61,6 @@ word_encoder.summary()
 word_latent_inputs = keras.Input(shape=(latent_dim,), name="latent_input")
 time_inputs = keras.Input(shape=(1,), name="time_input")
 
-# Time embedding
 time_embedding = layers.Embedding(
     input_dim=maxlen, output_dim=embedding_dim, input_length=1
 )(time_inputs)
@@ -81,18 +79,38 @@ word_decoder = keras.Model(
 word_decoder.summary()
 
 
+# # Score function
+# xt_inputs = keras.Input(shape=(latent_dim,), name="xt_input")
+# time_inputs = keras.Input(shape=(1,), name="time_input")
+
+# # Time embedding
+# time_embedding = layers.Embedding(
+#     input_dim=maxlen, output_dim=embedding_dim, input_length=1
+# )(time_inputs)
+# time_embedding = layers.Flatten()(time_embedding)
+
+# x = layers.concatenate([xt_inputs, time_embedding])
+# x = layers.Dense(32, activation="relu")(x)
+# x = layers.Dense(64, activation="relu")(x)
+
+# score_output = layers.Dense(
+#     latent_dim, activation="linear", name="log_gradient_output"
+# )(x)
+# score_model = keras.Model(
+#     inputs=[xt_inputs, time_inputs], outputs=score_output, name="score_model"
+# )
+# score_model.summary()
+
+
 # Score function
-xt_inputs = keras.Input(shape=(latent_dim,), name="xt_input")
-time_inputs = keras.Input(shape=(1,), name="time_input")
+xt_inputs = keras.Input(shape=(maxlen, latent_dim), name="xt_input")
+time_inputs = keras.Input(shape=(1,), name="time_input")  # Shape: (1,)
 
-# Time embedding
-time_embedding = layers.Embedding(
-    input_dim=maxlen, output_dim=embedding_dim, input_length=1
-)(time_inputs)
-time_embedding = layers.Flatten()(time_embedding)
+time_inputs_expanded = layers.RepeatVector(maxlen)(time_inputs)
+x = layers.concatenate([xt_inputs, time_inputs_expanded], axis=-1)
+x = layers.Flatten()(x)
 
-x = layers.concatenate([xt_inputs, time_embedding])
-x = layers.Dense(32, activation="relu")(x)
+x = layers.Dense(128, activation="relu")(x)
 x = layers.Dense(64, activation="relu")(x)
 
 score_output = layers.Dense(
@@ -140,21 +158,15 @@ class VAE(keras.Model):
 
     def apply_word_encoder(self, inputs):
         word_element, time_index = inputs
-        # batch_size = tf.shape(word_element)[0]
-
         time_index = tf.reshape(time_index, [])
         time_index = tf.fill([self.batch_size], time_index)
-
         z_mean, z_log_var, z = self.word_encoder([word_element, time_index])
         return z_mean, z_log_var, z
 
     def apply_word_decoder(self, inputs):
         z_element, time_index = inputs
-        # batch_size = tf.shape(z_element)[0]
-
         time_index = tf.reshape(time_index, [])
         time_index = tf.fill([self.batch_size], time_index)
-
         reconstruction = self.word_decoder([z_element, time_index])
         return reconstruction
 
@@ -170,52 +182,79 @@ class VAE(keras.Model):
         lse = max_z_log_var + tf.math.log(sum_exp)
         return lse
 
-    def diffusion(self, state, step):
-        xt, mu_tr, sigma_tr, error = state
-        time = tf.cast(step, dtype=tf.float32) * tf.cast(self.dt, dtype=tf.float32)
+    def mask_only_target_step(self, input_tensor_tr, target_time_step):
+        one_hot_mask = tf.one_hot(indices=target_time_step, depth=self.maxlen)
+        one_hot_mask = tf.reshape(one_hot_mask, shape=(self.maxlen, 1, 1))
+        mask = tf.tile(one_hot_mask, multiples=[1, self.batch_size, latent_dim])
+        output_tensor = input_tensor_tr * mask
+        return output_tensor
 
-        # batch_size = tf.shape(xt)[0]
+    def mask_below_target_step(self, input_tensor_tr, target_time_step):
+        indices = tf.range(self.maxlen)
+        mask = tf.less(indices, target_time_step)
+        mask = tf.reshape(mask, (self.maxlen, 1, 1))
+        mask = tf.cast(mask, tf.float32)
+        mask = tf.tile(mask, [1, self.batch_size, latent_dim])
+        output_tensor = input_tensor_tr * mask
+        return output_tensor
+
+    def diffusion(self, state, step, masked_mu_tr, masked_sigma_tr):
+        xt, mu_tr, sigma_tr, error = state
+        time = step
+
         time = tf.fill([self.batch_size, 1], time)
         sigma_std = tf.exp(0.5 * sigma_tr)
 
-        score = self.score_fn([xt, time])
-        logdx = -(xt - mu_tr) / sigma_tr
-        error = tf.math.squared_difference(logdx, score)
+        t_index = tf.squeeze(tf.math.floor(time[0]))
+        t_index = tf.cast(t_index, tf.int32)
+        one_hot = tf.one_hot(indices=t_index, depth=80)
+        one_hot = tf.reshape(one_hot, (self.maxlen, 1, 1))
+
+        delta = one_hot * tf.expand_dims(xt, axis=0)
+        score_input = masked_mu_tr + delta
+        score_input = tf.transpose(score_input, perm=[1, 0, 2])
+
+        score = self.score_fn([score_input, time])
+        logdx = -(xt - mu_tr) / tf.math.abs(sigma_tr)
+
+        error = tf.math.abs(logdx - score)
 
         dW = tf.random.normal(shape=tf.shape(mu_tr), mean=0.0, stddev=tf.sqrt(self.dt))
-        dx = (mu_tr + (0.5 * tf.square(sigma_std) * score)) * self.dt + sigma_std * dW
+        dx = (0.5 * tf.square(sigma_std) * score) + sigma_std * dW
         xt = xt + dx
         return (xt, mu_tr, sigma_tr, error)
 
-    def diffusion_step(self, inputs):
-        # mu_tr shape here = (1, batch, feat)
-        index, mu_tr, sigma_tr = inputs
+    def diffusion_step(
+        self, index, mu_tr, sigma_tr, full_mu_tr, full_sigma_tr, full_index
+    ):
+        masked_mu_tr = self.mask_below_target_step(full_mu_tr, target_time_step=index)
+        masked_sigma_tr = self.mask_below_target_step(
+            full_sigma_tr, target_time_step=index
+        )
 
-        steps = index + tf.range(int(1 / self.dt))
+        steps = int(1 / self.dt)
+        time = (
+            tf.cast(index, dtype=tf.float32)
+            + tf.range(steps, dtype=tf.float32) * self.dt
+        )
 
         x0 = mu_tr
         err0 = tf.zeros_like(x0)
         initial_state = (x0, mu_tr, sigma_tr, err0)
 
-        xt, _, _, error = tf.scan(self.diffusion, steps, initializer=initial_state)
+        xt, _, _, error = tf.scan(
+            lambda state, t: self.diffusion(state, t, masked_mu_tr, masked_sigma_tr),
+            time,
+            initializer=initial_state,
+        )
+
         xt_final = xt[-1]
         mean_error = tf.reduce_mean(error, axis=0)
         return xt_final, mean_error
 
     def diffusion_loss(self, z_mean, z_log_var):
-        z_mean_shifted = tf.concat(
-            [tf.zeros_like(z_mean[:, :1, :]), z_mean[:, :-1, :]], axis=1
-        )
-        mu = self.mu(z_mean_shifted, z_mean)
-
-        z_log_var_shifted = tf.concat(
-            [tf.zeros_like(z_log_var[:, :1, :]), z_log_var[:, :-1, :]], axis=1
-        )
-        sigma = self.sigma(z_log_var_shifted, z_log_var)
-
-        # mu shape = (time_steps, batch, features)
-        mu_tr = tf.transpose(mu, perm=[1, 0, 2])
-        sigma_tr = tf.transpose(sigma, perm=[1, 0, 2])
+        mu_tr = tf.transpose(z_mean, perm=[1, 0, 2])
+        sigma_tr = tf.transpose(z_log_var, perm=[1, 0, 2])
         index = tf.range(tf.shape(mu_tr)[0])
 
         output_signature = (
@@ -224,11 +263,14 @@ class VAE(keras.Model):
         )
 
         sequence, score_error = tf.map_fn(
-            fn=self.diffusion_step,
+            fn=lambda elems: self.diffusion_step(
+                elems[0], elems[1], elems[2], mu_tr, sigma_tr, index
+            ),
             elems=(index, mu_tr, sigma_tr),
             fn_output_signature=output_signature,
             parallel_iterations=10,
         )
+
         sequence = tf.transpose(sequence, perm=[1, 0, 2])
         score_error = tf.transpose(score_error, perm=[1, 0, 2])
         return sequence, score_error
@@ -273,10 +315,11 @@ class VAE(keras.Model):
             )
             kl_loss = ops.mean(kl_loss)
 
-            sequence, score_error = self.diffusion_loss(z_mean, z_log_var)
+            ez_log_var = tf.math.exp(z_log_var)
+            sequence, score_error = self.diffusion_loss(z_mean, ez_log_var)
             score_loss = ops.mean(ops.sum(score_error, axis=-1))
 
-            total_loss = reconstruction_loss + kl_loss + score_loss
+            total_loss = (reconstruction_loss + kl_loss) + score_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))

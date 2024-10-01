@@ -10,7 +10,7 @@ import tensorflow.strings as tf_strings
 
 import keras
 from keras.layers import TextVectorization
-from diffusionVae import word_encoder, word_decoder, score_model, VAE
+from vibes import word_encoder, word_decoder, score_model, VAE
 
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
@@ -22,10 +22,10 @@ import textwrap
 # Create a list all files
 filenames = []
 directories = [
-    "aclImdb/train/pos",
-    "aclImdb/train/neg",
+    # "aclImdb/train/pos",
+    # "aclImdb/train/neg",
     "aclImdb/test/pos",
-    "aclImdb/test/neg",
+    # "aclImdb/test/neg",
 ]
 for dir in directories:
     for f in os.listdir(dir):
@@ -221,34 +221,6 @@ def prepare_lm_inputs_labels(text):
     return x, y
 
 
-min_value = 0
-max_value = 1
-
-# def prepare_lm_tokens(text):
-#     tokenized_sentences = vectorize_layer(text)
-#     max_value = tf.reduce_max(tokenized_sentences)
-#     min_value = tf.reduce_min(tokenized_sentences)
-#     tokenized_sentences = (tokenized_sentences - min_value) / (max_value - min_value)
-#     x = tokenized_sentences[:-1]
-#     return x
-
-
-# def prepare_lm_tokens_words(text_batch):
-#     tokenized_sentences = vectorize_layer(text_batch)
-#     normalized_tokenized_sentences = (tokenized_sentences - min_value) / (
-#         max_value - min_value
-#     )
-#     normalized_tokens = normalized_tokenized_sentences[:, :-1]
-#     tokens = tokenized_sentences[:, :-1]
-
-#     words = []
-#     for token_sequence in tokens:
-#         word_sequence = [vocab[token_id.numpy()] for token_id in token_sequence]
-#         words.append(word_sequence)
-
-#     return normalized_tokens, words
-
-
 def prepare_lm_tokens(text):
     tokenized_sentences = vectorize_layer(text)
     x = tokenized_sentences[:-1]
@@ -271,7 +243,7 @@ def prepare_lm_tokens_words(text_batch):
 # Apply the function to your sentences
 normalized_tokens, words = prepare_lm_tokens_words(sentences)
 
-epochs = 30
+epochs = 10
 batch_size = 24
 
 text_ds_x_only = text_ds.map(prepare_lm_tokens, num_parallel_calls=tf_data.AUTOTUNE)
@@ -279,8 +251,10 @@ text_ds_x_only = text_ds_x_only.shuffle(buffer_size=256)
 text_ds_x_only = text_ds_x_only.batch(batch_size, drop_remainder=True)
 text_ds_x_only = text_ds_x_only.prefetch(tf_data.AUTOTUNE)
 
-vae = VAE(word_encoder, word_decoder, score_model, batch_size=batch_size)
-vae.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001))
+vae = VAE(
+    word_encoder, word_decoder, score_model, batch_size=batch_size, maxlen=80, dt=0.01
+)
+vae.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001))
 
 # example
 sample_text = "For a movie that gets no respect there sure are a lot of memorable quotes listed for this gem."
@@ -288,9 +262,34 @@ sample_tokens, sample_words = prepare_lm_tokens_words(sentences)
 
 sample_tokens = tf.expand_dims(sample_tokens, -1)
 
-# plot before training
-# plot_label_clusters(vae, sample_tokens, sample_words, level="word")
-# plot_label_clusters(vae, sample_tokens, sample_words, level="sentence")
+
+class TextGenerator(keras.callbacks.Callback):
+    def __init__(self, start_tokens, max_tokens, vocab):
+        self.start_tokens = start_tokens
+        self.max_tokens = max_tokens
+        self.vocab = vocab
+
+    def on_epoch_end(self, epoch, logs=None):
+        print("end of epoch: ", epoch)
+
+        # 1. "this movie is" - is passed as indexes from vocab
+        # 2. pad to maxlen - i.e.: maxlen = 80
+        # 3. the word index tokens are passed to vae.encoder.predict <- returns latent representation at each time t
+        # 4. z_mean, z_log_var are passed to a diffusion and generate path up to max sequence length
+        # 5. pass each xt to decoder to get indexes - these have to be conevrted to nearest integer
+        # 6. convert it
+
+
+# Tokenize starting prompt
+word_to_index = {}
+for index, word in enumerate(vocab):
+    word_to_index[word] = index
+
+max_tokens = 80
+start_prompt = "this movie is"
+start_tokens = [word_to_index.get(_, 1) for _ in start_prompt.split()]
+
+text_gen_callback = TextGenerator(start_tokens, max_tokens, vocab)
 
 vae.fit(text_ds_x_only, epochs=epochs, batch_size=batch_size)
 
