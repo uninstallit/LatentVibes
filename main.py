@@ -31,6 +31,7 @@ for dir in directories:
     for f in os.listdir(dir):
         filenames.append(os.path.join(dir, f))
 
+epochs = 10
 batch_size = 24
 text_ds = tf_data.TextLineDataset(filenames)
 
@@ -75,8 +76,7 @@ def plot_label_clusters(vae, data, labels, level="sentence"):
 
     # Reshape data and get word-level latent representations
     data_reshaped = tf.reshape(data, [-1, 1])
-    time_input = tf.fill([data_reshaped.shape[0], 1], 10)
-    z_mean_word, _, _ = vae.word_encoder.predict([data_reshaped, time_input], verbose=0)
+    z_mean_word, _, _ = vae.word_encoder.predict(data_reshaped, verbose=0)
     latent_dim_word = z_mean_word.shape[-1]
 
     if level == "word":
@@ -172,11 +172,6 @@ def plot_label_clusters(vae, data, labels, level="sentence"):
     plt.show()
 
 
-import tensorflow as tf
-import matplotlib.pyplot as plt
-import numpy as np
-
-
 def plot_running_sum(data, vae, maxlen=None):
 
     if not isinstance(data, tf.Tensor):
@@ -243,9 +238,6 @@ def prepare_lm_tokens_words(text_batch):
 # Apply the function to your sentences
 normalized_tokens, words = prepare_lm_tokens_words(sentences)
 
-epochs = 10
-batch_size = 24
-
 text_ds_x_only = text_ds.map(prepare_lm_tokens, num_parallel_calls=tf_data.AUTOTUNE)
 text_ds_x_only = text_ds_x_only.shuffle(buffer_size=256)
 text_ds_x_only = text_ds_x_only.batch(batch_size, drop_remainder=True)
@@ -269,15 +261,51 @@ class TextGenerator(keras.callbacks.Callback):
         self.max_tokens = max_tokens
         self.vocab = vocab
 
-    def on_epoch_end(self, epoch, logs=None):
-        print("end of epoch: ", epoch)
+        self.pad_token = 0  # Assuming 0 is the padding token index
+        self.unk_token = 1  # Assuming 1 is the <UNK> token index
 
-        # 1. "this movie is" - is passed as indexes from vocab
-        # 2. pad to maxlen - i.e.: maxlen = 80
-        # 3. the word index tokens are passed to vae.encoder.predict <- returns latent representation at each time t
-        # 4. z_mean, z_log_var are passed to a diffusion and generate path up to max sequence length
-        # 5. pass each xt to decoder to get indexes - these have to be conevrted to nearest integer
-        # 6. convert it
+    def on_epoch_end(self, epoch, logs=None):
+        # Step 1: Start with the initial tokens
+        generated_tokens = self.start_tokens.copy()
+
+        # Step 2: Pad the tokens to maxlen if necessary
+        if len(generated_tokens) < self.max_tokens:
+            padding_length = self.max_tokens - len(generated_tokens)
+            generated_tokens += [self.pad_token] * padding_length
+        else:
+            generated_tokens = generated_tokens[: self.max_tokens]
+
+        # Step 3: Perform diffusion step-by-step to generate the latent path
+        input_tokens = tf.convert_to_tensor(generated_tokens, dtype=tf.float32)
+        z_mean, z_log_var, _ = self.model.word_encoder.predict(input_tokens, verbose=0)
+
+        z_mean = tf.expand_dims(z_mean, axis=0)
+        z_log_var = tf.expand_dims(z_log_var, axis=0)
+
+        ez_log_var = tf.math.exp(z_log_var)
+        # sequence shape: sequence:  (1, 80, 10)
+        sequence, _ = self.model.diffusion_loss(z_mean, ez_log_var, batch_size=1)
+
+        # Step 4: Decode each latent vector to obtain tokens
+        sequence = tf.squeeze(sequence, axis=0)
+        decoded_sequence = self.model.word_decoder.predict(sequence, verbose=0)
+
+        token_ids = np.rint(decoded_sequence).astype(int).flatten()
+
+        # Step 5: Convert tokens to words and combine into single string
+        generated_words = [
+            self.vocab[token_id] if 0 <= token_id < len(self.vocab) else "<UNK>"
+            for token_id in token_ids
+        ]
+
+        generated_text = " ".join(generated_words)
+
+        wrapped_text = textwrap.fill(generated_text, width=70)
+        border = "*" * 80
+        print("\n" + border)
+        print(f"Generated Text (Epoch #{epoch}):")
+        print(f"\n- {wrapped_text}")
+        print(border + "\n")
 
 
 # Tokenize starting prompt
@@ -290,10 +318,11 @@ start_prompt = "this movie is"
 start_tokens = [word_to_index.get(_, 1) for _ in start_prompt.split()]
 
 text_gen_callback = TextGenerator(start_tokens, max_tokens, vocab)
+# text_gen_callback.on_epoch_end(epoch=1)
 
-vae.fit(text_ds_x_only, epochs=epochs, batch_size=batch_size)
+vae.fit(
+    text_ds_x_only, epochs=epochs, batch_size=batch_size, callbacks=[text_gen_callback]
+)
 
 # plot after training
 plot_label_clusters(vae, sample_tokens, sample_words, level="word")
-# plot_label_clusters(vae, sample_tokens, sample_words, level="sentence")
-# plot_running_sum(sample_tokens, vae, maxlen)
