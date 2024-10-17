@@ -35,7 +35,7 @@ word_encoder_inputs = keras.Input(shape=(1,), name="word_input")
 word_embedding = layers.Embedding(
     input_dim=vocab_size,
     output_dim=embedding_dim,
-    input_length=1,
+    # input_length=1,
     name="word_embedding",
 )(word_encoder_inputs)
 word_embedding = layers.Flatten(name="flatten_word_embedding")(word_embedding)
@@ -78,7 +78,7 @@ word_decoder.summary()
 
 # Score function
 xt_inputs = keras.Input(shape=(maxlen, latent_dim), name="xt_input")
-time_inputs = keras.Input(shape=(1,), name="time_input") 
+time_inputs = keras.Input(shape=(1,), name="time_input")
 
 time_inputs_expanded = layers.RepeatVector(maxlen)(time_inputs)
 x = layers.concatenate([xt_inputs, time_inputs_expanded], axis=-1)
@@ -205,119 +205,146 @@ class VAE(keras.Model):
         shifted_x = tf.concat([zeros, x[:, :-1, :]], axis=1)
         return shifted_x
 
-    def diffusion(
-        self,
-        state,
-        step,
-        masked_mu_tr,
-        masked_sigma_tr,
-        full_mu_tr,
-        full_sigma_tr,
-        batch_size,
-    ):
-        xt, mu_tr, sigma_tr, error = state
-        time = step
+    def add_to_diagonal_simple(self, tensorA, tensorB, batch_size):
+
+        # Create batch indices
+        batch_indices = tf.range(batch_size * self.maxlen)  # Shape: (batch_steps,)
+
+        # Compute step indices (diagonal positions)
+        step_indices = tf.math.mod(batch_indices, self.maxlen)  # Shape: (batch_steps,)
+
+        # Create a mask for the diagonal elements
+        mask = tf.one_hot(step_indices, self.maxlen)  # Shape: (batch_steps, steps)
+
+        # Expand dimensions to match A and B
+        mask_expanded = tf.expand_dims(mask, axis=-1)  # Shape: (batch_steps, steps, 1)
+        tensorB_expanded = tf.expand_dims(
+            tensorB, axis=1
+        )  # Shape: (batch_steps, 1, features)
+
+        # Compute the updates
+        updates = (
+            mask_expanded * tensorB_expanded
+        )  # Shape: (batch_steps, steps, features)
+
+        # Add the updates to A
+        tensorA_updated = tensorA + updates
+
+        return tensorA_updated
+
+    def diffusion(self, state, time):
+        # shape=(80, 80, 10)
+        xt, batch_size = state
 
         time = tf.fill([batch_size, 1], time)
-        sigma_std = tf.math.sqrt(sigma_tr)
+        time = tf.tile(time, [1, self.maxlen])
+        time = tf.reshape(time, (batch_size * self.maxlen, 1))
 
-        t_index = tf.squeeze(tf.math.floor(time[0]))
-        t_index = tf.cast(t_index, tf.int32)
-        one_hot = tf.one_hot(indices=t_index, depth=80)
-        one_hot = tf.reshape(one_hot, (self.maxlen, 1, 1))
+        score = self.score_fn([xt, time])
 
-        next_mu = full_mu_tr[t_index + 1, :, :]
-        next_sigma = full_sigma_tr[t_index + 1, :, :]
+        dW = tf.random.normal(shape=tf.shape(score), mean=0.0, stddev=tf.sqrt(self.dt))
+        dx = (0.5 * score) + dW
+        xt = self.add_to_diagonal_simple(xt, dx, batch_size)
 
-        delta = one_hot * tf.expand_dims(xt, axis=0)
-        score_input = masked_mu_tr + delta
-        score_input = tf.transpose(score_input, perm=[1, 0, 2])
-
-        score = self.score_fn([score_input, time])
-        logdx = -(xt - next_mu) / tf.math.sqrt(next_sigma)
-
-        error = tf.math.abs(logdx - score)
-
-        dW = tf.random.normal(shape=tf.shape(mu_tr), mean=0.0, stddev=tf.sqrt(self.dt))
-        dx = (0.5 * tf.square(sigma_std) * score) + sigma_std * dW
-        xt = xt + dx
-        return (xt, mu_tr, sigma_tr, error)
-
-    def diffusion_step(
-        self, index, mu_tr, sigma_tr, full_mu_tr, full_sigma_tr, full_index, batch_size
-    ):
-        masked_mu_tr = self.mask_below_target_step(
-            full_mu_tr, target_time_step=index, batch_size=batch_size
-        )
-        masked_sigma_tr = self.mask_below_target_step(
-            full_sigma_tr, target_time_step=index, batch_size=batch_size
-        )
-
-        steps = int(1 / self.dt)
-        time = (
-            tf.cast(index, dtype=tf.float32)
-            + tf.range(0, steps, dtype=tf.float32) * self.dt
-        )
-
-        zero_step = tf.zeros([1, batch_size, latent_dim], dtype=full_mu_tr.dtype)
-        full_mu_tr_ext = tf.concat([zero_step, full_mu_tr], axis=0)
-        full_sigma_tr_ext = tf.concat([zero_step, full_sigma_tr], axis=0)
-
-        # x0 = mu_tr
-        x0 = tf.random.normal(
-            shape=tf.shape(mu_tr),
-            mean=mu_tr,
-            stddev=tf.math.sqrt(sigma_tr),
-            dtype=mu_tr.dtype,
-        )
-        err0 = tf.zeros_like(x0)
-        initial_state = (x0, mu_tr, sigma_tr, err0)
-
-        xt, _, _, error = tf.scan(
-            lambda state, t: self.diffusion(
-                state,
-                t,
-                masked_mu_tr,
-                masked_sigma_tr,
-                full_mu_tr_ext,
-                full_sigma_tr_ext,
-                batch_size,
-            ),
-            time,
-            initializer=initial_state,
-        )
-
-        # last value of diffusion
-        xt_final = xt[-1]
-
-        # mean_error = tf.reduce_mean(error, axis=0)
-        mean_error = tf.reduce_sum(error, axis=0)
-        return xt_final, mean_error
+        return (xt, batch_size)
 
     def diffusion_loss(self, z_mean, z_log_var, batch_size):
+
+        mu = tf.expand_dims(z_mean, axis=1)
+        mu = tf.tile(mu, multiples=[1, self.maxlen, 1, 1])
+
+        # mask upper triangle
+        mu = tf.linalg.band_part(mu, -1, 0)
+
+        diagonal = tf.linalg.diag_part(mu)
+        score_input = tf.linalg.set_diag(mu, tf.zeros(tf.shape(diagonal)))
+
+        x0 = tf.reshape(
+            score_input, (self.maxlen * batch_size, self.maxlen, latent_dim)
+        )
+
+        steps = tf.range(0, 1, delta=self.dt, dtype=tf.float32)
+
+        initial_state = (x0, batch_size)
+
+        xt, _ = tf.scan(self.diffusion, steps, initializer=initial_state)
+
+        xt_final = tf.reshape(
+            xt[-1], shape=(batch_size, self.maxlen, self.maxlen, latent_dim)
+        )
+
+        loss = tf.reduce_mean(tf.abs(mu - xt_final))
+
+        return loss
+
+
+
+    def add_tensor_slice(self, tensorA, tensorB, target_step, batch_size):
+        time_indices = tf.fill([batch_size], target_step)
+        batch_indices = tf.range(batch_size, dtype=tf.int32)
+        indices = tf.stack([time_indices, batch_indices], axis=1)
+        tensorA = tf.tensor_scatter_nd_add(tensorA, indices, tensorB)
+        return tensorA
+
+    def update_tensor_slice(self, tensorA, tensorB, target_step, batch_size):
+        time_indices = tf.fill([batch_size], target_step)
+        batch_indices = tf.range(batch_size, dtype=tf.int32)
+        indices = tf.stack([time_indices, batch_indices], axis=1)
+        tensorA = tf.tensor_scatter_nd_update(tensorA, indices, tensorB)
+        return tensorA
+
+    def generate(self, state, time):
+        xt, masked_mu_tr, masked_sigma_tr, target_step, batch_size = state
+
+        score_input = tf.transpose(masked_mu_tr, perm=[1, 0, 2])
+        time = tf.expand_dims(time, axis=-1)
+        score = self.score_fn([score_input, time])
+
+        dW = tf.random.normal(shape=tf.shape(xt), mean=0.0, stddev=tf.sqrt(self.dt))
+        dx = (0.5 * score) + dW
+        xt = xt + dx
+
+        masked_mu_tr = self.update_tensor_slice(
+            masked_mu_tr, xt, target_step, batch_size
+        )
+        return (xt, masked_mu_tr, masked_sigma_tr, target_step, batch_size)
+
+    def geretate_step(self, state, index):
+        masked_mu_tr, masked_sigma_tr, batch_size = state
+
+        steps = int(1 / self.dt)
+        time = tf.range(0, steps, dtype=tf.float32) * self.dt
+
+        x0 = masked_mu_tr[index, :, :]
+        initial_state = (x0, masked_mu_tr, masked_sigma_tr, index, batch_size)
+
+        _, updated_mu_tr, updated_sigma_tr, _, _ = tf.scan(
+            self.generate, time, initializer=initial_state
+        )
+
+        mu_tr_final = updated_mu_tr[-1]
+        sigma_tr_final = updated_sigma_tr[-1]
+        return (mu_tr_final, sigma_tr_final, batch_size)
+
+    def diffusion_generate(self, z_mean, z_log_var, batch_size, start_index):
         mu_tr = tf.transpose(z_mean, perm=[1, 0, 2])
         sigma_tr = tf.transpose(z_log_var, perm=[1, 0, 2])
 
-        index = tf.range(tf.shape(mu_tr)[0])
+        index = tf.range(start=start_index, limit=tf.shape(mu_tr)[0])
 
-        output_signature = (
-            tf.TensorSpec(shape=(batch_size, latent_dim), dtype=tf.float32),
-            tf.TensorSpec(shape=(batch_size, latent_dim), dtype=tf.float32),
+        masked_mu_tr = self.mask_below_target_step(
+            mu_tr, target_time_step=start_index, batch_size=batch_size
+        )
+        masked_sigma_tr = self.mask_below_target_step(
+            sigma_tr, target_time_step=start_index, batch_size=batch_size
         )
 
-        sequence, score_error = tf.map_fn(
-            fn=lambda elems: self.diffusion_step(
-                elems[0], elems[1], elems[2], mu_tr, sigma_tr, index, batch_size
-            ),
-            elems=(index, mu_tr, sigma_tr),
-            fn_output_signature=output_signature,
-            parallel_iterations=10,
-        )
+        initial_state = (masked_mu_tr, masked_sigma_tr, batch_size)
+        updated_mu_tr, _, _ = tf.scan(self.geretate_step, index, initial_state)
 
-        sequence = tf.transpose(sequence, perm=[1, 0, 2])
-
-        score_error = tf.transpose(score_error, perm=[1, 0, 2])
-        return sequence, score_error
+        mu_tr_final = updated_mu_tr[-1]
+        mu_final = tf.transpose(mu_tr_final, perm=[1, 0, 2])
+        return mu_final
 
     def train_step(self, data):
 
@@ -357,11 +384,12 @@ class VAE(keras.Model):
             kl_loss = tf.reduce_mean(kl_loss)
 
             ez_log_var = tf.math.exp(z_log_var)
-            sequence, score_error = self.diffusion_loss(
+
+            score_loss = self.diffusion_loss(
                 z_mean, ez_log_var, batch_size=self.batch_size
             )
 
-            score_loss = ops.mean(ops.sum(score_error, axis=-1))
+            # score_loss = ops.mean(ops.sum(score_error, axis=-1))
 
             beta = 0.8
             total_loss = (
@@ -382,12 +410,12 @@ class VAE(keras.Model):
 
 
 # Define the checkpoint callback to save only the best model
-checkpoint_filepath = "/best_vae_model/ckpt/checkpoint.model.keras"
-checkpoint_callback = keras.callbacks.ModelCheckpoint(
-    filepath=checkpoint_filepath,
-    save_weights_only=False,  # Save the entire model
-    monitor="loss",  # Monitor the loss for determining the best model
-    mode="min",  # Save the model with the minimum loss
-    save_best_only=True,  # Save only when the monitored metric improves
-    save_freq="epoch",  # Save at the end of every epoch
-)
+# checkpoint_filepath = "/best_vae_model/ckpt/checkpoint.model.keras"
+# checkpoint_callback = keras.callbacks.ModelCheckpoint(
+#     filepath=checkpoint_filepath,
+#     save_weights_only=False,  # Save the entire model
+#     monitor="loss",  # Monitor the loss for determining the best model
+#     mode="min",  # Save the model with the minimum loss
+#     save_best_only=True,  # Save only when the monitored metric improves
+#     save_freq="epoch",  # Save at the end of every epoch
+# )
