@@ -6,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 import keras
 from keras import ops
-from keras import layers
+from keras import layers, losses
 from gloveEmbeddings import embedding_layer
 
 
@@ -64,17 +64,12 @@ class Vibes(keras.Model):
         self.maxlen = maxlen
         self.dt = dt
 
-        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = keras.metrics.Mean(name="recon_loss")
-        self.kl_loss_tracker = keras.metrics.Mean(name="kl_loss")
+        self.step_loss_tracker = keras.metrics.Mean(name="step_loss")
+        self.sequence_loss_tracker = keras.metrics.Mean(name="sequence_loss")
 
     @property
     def metrics(self):
-        return [
-            self.total_loss_tracker,
-            self.reconstruction_loss_tracker,
-            self.kl_loss_tracker,
-        ]
+        return [self.step_loss_tracker, self.sequence_loss_tracker]
 
     def get_maxlen(self):
         return self.maxlen
@@ -128,8 +123,30 @@ class Vibes(keras.Model):
         diagonal = tf.gather_nd(xt, indices)
         return diagonal
 
+    def vectorized_masking(
+        self, embeddings_tr, batch_size, latent_dim, maxlen, include=True
+    ):
+        indices = tf.range(maxlen)
+        time_steps = tf.expand_dims(tf.range(maxlen), axis=1)
+
+        if include:
+            masks = tf.less(indices, time_steps)
+        else:
+            masks = tf.less_equal(indices, time_steps)
+
+        masks = tf.cast(masks, tf.float32)
+        masks = tf.expand_dims(masks, axis=2)
+        masks = tf.expand_dims(masks, axis=3)
+        masks = tf.tile(masks, [1, 1, batch_size, latent_dim])
+
+        embeddings_expanded = tf.expand_dims(embeddings_tr, axis=0)
+        embeddings_expanded = tf.tile(embeddings_expanded, [maxlen, 1, 1, 1])
+
+        masked_embeddings = embeddings_expanded * masks
+        return masked_embeddings
+
     def diffusion(self, state, time):
-        xt, mu, batch_size = state
+        xt, labels, error, batch_size = state
 
         time = tf.fill([batch_size, 1], time)
         time = tf.tile(time, [1, self.maxlen])
@@ -138,7 +155,11 @@ class Vibes(keras.Model):
         score = self.score_fn([xt, time])
         score_norm = tf.norm(score)
 
-        dW = tf.random.normal(shape=tf.shape(score), mean=0.0, stddev=tf.sqrt(self.dt))
+        dW = tf.random.normal(
+            shape=(self.maxlen * batch_size, latent_dim),
+            mean=0.0,
+            stddev=tf.sqrt(self.dt),
+        )
         dx = (0.5 * score * self.dt) + (score_norm * dW)
 
         xt = tf.transpose(xt, perm=[1, 0, 2])
@@ -151,28 +172,22 @@ class Vibes(keras.Model):
                 shape=(None, latent_dim), dtype=tf.float32
             ),
         )
+
+        predictions = tf.reshape(
+            xt_updated, (self.maxlen, self.maxlen, batch_size, latent_dim)
+        )
+        predictions = self.gather_diagonal_slices(predictions)
+
+        error += losses.mean_squared_error(labels, predictions)
+
         xt_updated = tf.transpose(xt_updated, perm=[1, 0, 2])
-        return (xt_updated, mu, batch_size)
+        return (xt_updated, labels, error, batch_size)
 
     def diffusion_loss(self, embeddings, batch_size):
         embeddings_tr = tf.transpose(embeddings, perm=[1, 0, 2])
 
-        embeddings_tr_tiled = tf.map_fn(
-            lambda t: self.mask_below_target_step(embeddings_tr, t, batch_size),
-            elems=tf.range(self.maxlen, dtype=tf.int32),
-            fn_output_signature=tf.TensorSpec(
-                shape=(self.maxlen, batch_size, latent_dim), dtype=tf.float32
-            ),
-        )
-
-        true_embeddings_tr_tiled = tf.map_fn(
-            lambda t: self.mask_below_target_step(
-                embeddings_tr, t, batch_size, include=False
-            ),
-            elems=tf.range(self.maxlen, dtype=tf.int32),
-            fn_output_signature=tf.TensorSpec(
-                shape=(self.maxlen, batch_size, latent_dim), dtype=tf.float32
-            ),
+        embeddings_tr_tiled = self.vectorized_masking(
+            embeddings_tr, batch_size=batch_size, latent_dim=latent_dim, maxlen=maxlen
         )
 
         score_input = tf.reshape(
@@ -180,40 +195,37 @@ class Vibes(keras.Model):
         )
         score_input = tf.transpose(score_input, perm=[1, 0, 2])
 
-        score_labels = tf.reshape(
-            true_embeddings_tr_tiled,
-            (self.maxlen, self.maxlen * batch_size, latent_dim),
+        embeddings_tr_tiled_with_target = self.vectorized_masking(
+            embeddings_tr, batch_size=batch_size, latent_dim=latent_dim, maxlen=maxlen
         )
-        score_labels = tf.transpose(score_labels, perm=[1, 0, 2])
+        labels = self.gather_diagonal_slices(embeddings_tr_tiled_with_target)
 
         steps = tf.range(0, 1, delta=self.dt, dtype=tf.float32)
-        initial_state = (score_input, score_labels, batch_size)
+        step_loss = tf.zeros(shape=(self.maxlen, batch_size))
 
-        xt, _ = tf.scan(self.diffusion, steps, initializer=initial_state)
+        initial_state = (score_input, labels, step_loss, batch_size)
+        xt, _, error, _ = tf.scan(self.diffusion, steps, initializer=initial_state)
 
         xt = tf.reshape(xt[-1], (self.maxlen, self.maxlen, batch_size, latent_dim))
         xt = self.gather_diagonal_slices(xt)
         xt = tf.transpose(xt, perm=[1, 0, 2])
 
-        # sequence loss should not be used for training
-        loss = tf.reduce_mean(tf.abs(embeddings - xt))
-        return (xt, loss)
+        step_loss = tf.reduce_sum(error)
+        sequence_loss = tf.reduce_mean(tf.abs(embeddings - xt))
+        return (xt, step_loss, sequence_loss)
 
     def generate(self, state, time):
-        # target_step=3
-        # xt ~ embeddings_tr shape=(80, 1, 100)
         xt, target_step, batch_size = state
 
-        # embeddings_tr shape=(1, 80, 100)
         score_input = tf.transpose(xt, perm=[1, 0, 2])
-
-        # time fix later
         time = tf.expand_dims(time, axis=-1)
 
         score = self.score_fn([score_input, time])
         score_norm = tf.norm(score)
 
-        dW = tf.random.normal(shape=tf.shape(score), mean=0.0, stddev=tf.sqrt(self.dt))
+        dW = tf.random.normal(
+            shape=(batch_size, latent_dim), mean=0.0, stddev=tf.sqrt(self.dt)
+        )
         dx = (0.5 * score * self.dt) + (score_norm * dW)
 
         xt = tf.transpose(xt, perm=[1, 0, 2])
@@ -247,7 +259,7 @@ class Vibes(keras.Model):
 
     def train_step(self, data):
 
-        with tf.GradientTape(persistent=True) as tape:
+        with tf.GradientTape() as tape:
             transposed_data = tf.transpose(data, perm=[1, 0])
 
             embeddings = tf.map_fn(
@@ -260,14 +272,24 @@ class Vibes(keras.Model):
             embeddings = tf.squeeze(embeddings, axis=2)
             embeddings = tf.transpose(embeddings, perm=[1, 0, 2])
 
-            _, score_loss = self.diffusion_loss(embeddings, batch_size=self.batch_size)
+            print('embeddings map fn: ', embeddings)
+            
+            all_embeddings = self.word_encoder(data)
+            
+            print('all_embeddings: ', all_embeddings)
+            exit()
 
-            total_loss = score_loss
+            _, step_loss, sequence_loss = self.diffusion_loss(
+                embeddings, batch_size=self.batch_size
+            )
 
-        grads = tape.gradient(total_loss, self.trainable_weights)
+        grads = tape.gradient(step_loss, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
 
-        self.total_loss_tracker.update_state(total_loss)
+        self.step_loss_tracker.update_state(step_loss)
+        self.sequence_loss_tracker.update_state(sequence_loss)
+
         return {
-            "loss": self.total_loss_tracker.result(),
+            "loss": self.step_loss_tracker.result(),
+            "sequence": self.sequence_loss_tracker.result(),
         }

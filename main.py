@@ -8,21 +8,23 @@ import tensorflow.data as tf_data
 import tensorflow.strings as tf_strings
 
 import keras
-from keras.layers import TextVectorization
+from keras import layers
 from vibesDry import word_encoder, score_model, Vibes
 from gloveEmbeddings import embedding_matrix
 
 import numpy as np
 from numpy.linalg import norm
 
+import textwrap
+
 # The dataset contains each review in a separate text file
 # The text files are present in four different folders
 # Create a list all files
 filenames = []
 directories = [
-    # "aclImdb/train/pos",
-    # "aclImdb/train/neg",
-    "aclImdb/test/pos",
+    "aclImdb/train/pos",
+    "aclImdb/train/neg",
+    # "aclImdb/test/pos",
     # "aclImdb/test/neg",
 ]
 for dir in directories:
@@ -53,7 +55,7 @@ vocab_size = 20000  # Only consider the top 20k words
 maxlen = 80  # Max sequence size
 
 # Create a vectorization layer and adapt it to the text
-vectorize_layer = TextVectorization(
+vectorize_layer = layers.TextVectorization(
     standardize=custom_standardization,
     max_tokens=vocab_size - 1,
     output_mode="int",
@@ -113,61 +115,69 @@ class TextGenerator(keras.callbacks.Callback):
         self.start_tokens = start_tokens
         self.max_tokens = max_tokens
         self.vocab = vocab
+        self.word_index = {word: idx for idx, word in enumerate(vocab)}
         self.pad_token = 0
         self.unk_token = 1
         self.batch_count = 0
 
-    def find_closest_words_cosine_batch(self, new_embeddings):
-        new_embeddings_norm = new_embeddings / norm(
-            new_embeddings, axis=1, keepdims=True
+    def get_updated_embedding_matrix(self):
+        embedding_layer = self.model.word_encoder.get_layer("embedding")
+        embedding_matrix = embedding_layer.get_weights()
+
+        embedding_matrix = embedding_layer.get_weights()[0]
+        return embedding_matrix
+
+    def find_closest_words_euclidean(self, new_embeddings):
+        embedding_matrix = self.get_updated_embedding_matrix()
+
+        distances = np.linalg.norm(
+            new_embeddings[:, np.newaxis] - embedding_matrix, axis=2
         )
+        closest_indices = np.argmin(distances, axis=1)
+        closest_words = [self.vocab[idx] for idx in closest_indices]
 
-        cosine_similarities = np.dot(new_embeddings_norm, embedding_matrix_norm.T)
-        closest_indices = np.argmax(cosine_similarities, axis=1)
-        closest_words = [vocab[idx] for idx in closest_indices]
-
-        similarity_scores = cosine_similarities[
-            np.arange(len(new_embeddings)), closest_indices
-        ]
-        return closest_words, similarity_scores
+        distance_scores = distances[np.arange(len(new_embeddings)), closest_indices]
+        return closest_words, distance_scores
 
     def on_batch_end(self, batch, logs=None):
         self.batch_count += 1
 
-        if (self.batch_count) % 10 == 0:
+        if (self.batch_count) % 50 == 0:
             start_index = len(self.start_tokens)
 
             # Step 1: Start with the initial tokens
             generated_tokens = self.start_tokens.copy()
 
-            # Step 2: Pad the tokens to maxlen if necessary
+            # Step 2: Pad the tokens to max_tokens if necessary
             if len(generated_tokens) < self.max_tokens:
                 padding_length = self.max_tokens - len(generated_tokens)
                 generated_tokens += [self.pad_token] * padding_length
             else:
                 generated_tokens = generated_tokens[: self.max_tokens]
 
-            # Step 3: Perform diffusion step-by-step to generate the latent path
-            input_tokens = tf.convert_to_tensor(generated_tokens, dtype=tf.float32)
-            embeddings = vae.word_encoder.predict(input_tokens, verbose=0)
-            # embeddings = tf.transpose(embeddings, perm=[1, 0, 2])
+            # Step 3: Generate embeddings for the input tokens
+            input_tokens = tf.convert_to_tensor([generated_tokens], dtype=tf.int32)
+            embeddings = self.model.word_encoder.predict(input_tokens, verbose=0)
+            embeddings_tr = tf.transpose(embeddings, perm=[1, 0, 2])
 
-            sequence = vae.diffusion_generate(
-                embeddings, batch_size=1, start_index=start_index
+            # Step 4: Perform diffusion to generate new embeddings
+            sequence = self.model.diffusion_generate(
+                embeddings_tr, batch_size=1, start_index=start_index
             )
-            sequence = tf.squeeze(sequence, axis=0)
+            sequence = tf.squeeze(sequence, axis=0).numpy()
 
-            closest_words, similarity_scores = self.find_closest_words_cosine_batch(
+            # Step 5: Find the closest words to the generated embeddings
+            closest_words, similarity_scores = self.find_closest_words_euclidean(
                 sequence
             )
 
-            # generated_text = " ".join(closest_words)
-            # wrapped_text = textwrap.fill(generated_text, width=70)
+            # Step 6: Construct and display the generated text
+            generated_text = " ".join(closest_words)
+            wrapped_text = textwrap.fill(generated_text, width=70)
             border = "*" * 80
             print("\n" + border)
-            print(f"\nGenerated Text (Epoch #{self.batch_count}):")
-            # print(f"\n- {wrapped_text}")
-            print(f"\n- {closest_words}")
+            print(f"\nGenerated Text (Batch #{self.batch_count}):")
+            print(f"\n- {wrapped_text}")
             print("\n" + border + "\n")
 
 

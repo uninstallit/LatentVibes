@@ -92,10 +92,11 @@ for word, i in word_index.items():
         misses += 1
 print("Converted %d words (%d misses)" % (hits, misses))
 
+# needs to be implemented
+# def get_embedding_matrix()
+
 embedding_layer = layers.Embedding(
-    num_tokens,
-    embedding_dim,
-    trainable=False,
+    num_tokens, embedding_dim, trainable=True, name="embedding"
 )
 embedding_layer.build((1,))
 embedding_layer.set_weights([embedding_matrix])
