@@ -2,18 +2,19 @@ import os
 
 os.environ["KERAS_BACKEND"] = "tensorflow"
 
-import numpy as np
-import tensorflow as tf
 import keras
-from keras import ops
 from keras import layers, losses
+import tensorflow as tf
 from gloveEmbeddings import embedding_layer
 
+from vibesConfig import (
+    latent_dim,
+    maxlen,
+    num_heads,
+    ff_dim,
+    num_layers,
+)
 
-latent_dim = 100
-maxlen = 80
-vocab_size = 20000
-embedding_dim = 100
 
 # =========================
 # Encoder
@@ -30,15 +31,80 @@ word_encoder.summary()
 # Score Function
 # =========================
 
+# xt_inputs = keras.Input(shape=(maxlen, latent_dim), name="xt_input")
+# time_inputs = keras.Input(shape=(1,), name="time_input")
+
+# time_inputs_expanded = layers.RepeatVector(maxlen)(time_inputs)
+# x = layers.concatenate([xt_inputs, time_inputs_expanded], axis=-1)
+# x = layers.TimeDistributed(layers.Dense(64, activation="relu"))(x)
+
+# x = layers.Flatten()(x)
+# x = layers.LayerNormalization()(x)
+
+# x = layers.Dense(128, activation="relu")(x)
+# x = layers.Dense(64, activation="relu")(x)
+# x = layers.Dense(32, activation="relu")(x)
+
+# score_output = layers.Dense(
+#     latent_dim, activation="linear", name="log_gradient_output"
+# )(x)
+# score_model = keras.Model(
+#     inputs=[xt_inputs, time_inputs], outputs=score_output, name="score_model"
+# )
+# score_model.summary()
+
+
+# =========================
+# Transformer Encoder Block
+# =========================
+
+
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.1, name=None):
+    # Multi-Head Self-Attention
+    attention_output = layers.MultiHeadAttention(
+        key_dim=head_size, num_heads=num_heads, dropout=dropout, name=name
+    )(inputs, inputs)
+    attention_output = layers.Dropout(dropout)(attention_output)
+    attention_output = layers.Add()([attention_output, inputs])  # Residual Connection
+    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output)
+
+    # Feed-Forward Network
+    ffn = layers.Dense(ff_dim, activation="relu")(attention_output)
+    ffn = layers.Dense(inputs.shape[-1])(ffn)
+    ffn = layers.Dropout(dropout)(ffn)
+    ffn_output = layers.Add()([ffn, attention_output])  # Residual Connection
+    ffn_output = layers.LayerNormalization(epsilon=1e-6)(ffn_output)
+    return ffn_output
+
+
+# =========================
+# Transformer Encoder Model
+# =========================
+
+# Define the inputs
 xt_inputs = keras.Input(shape=(maxlen, latent_dim), name="xt_input")
 time_inputs = keras.Input(shape=(1,), name="time_input")
 
-time_inputs_expanded = layers.RepeatVector(maxlen)(time_inputs)
-x = layers.concatenate([xt_inputs, time_inputs_expanded], axis=-1)
-x = layers.TimeDistributed(layers.Dense(64, activation="relu"))(x)
+# Repeat time_inputs to match maxlen
+time_inputs_repeated = layers.RepeatVector(maxlen)(time_inputs)
+time_inputs_expanded = layers.Reshape((maxlen, 1))(time_inputs_repeated)
 
-x = layers.Flatten()(x)
-x = layers.LayerNormalization()(x)
+# Concatenate xt_inputs with the repeated and expanded time_inputs
+x = layers.Concatenate(axis=-1)([xt_inputs, time_inputs_expanded])
+
+# Stack multiple Transformer Encoder layers
+for layer_num in range(num_layers):
+    x = transformer_encoder(
+        x,
+        head_size=latent_dim,
+        num_heads=num_heads,
+        ff_dim=ff_dim,
+        dropout=0.1,
+        name=f"transformer_encoder_{layer_num+1}",
+    )
+
+# Aggregate the sequence information
+x = layers.GlobalAveragePooling1D()(x)
 
 x = layers.Dense(128, activation="relu")(x)
 x = layers.Dense(64, activation="relu")(x)
@@ -47,20 +113,27 @@ x = layers.Dense(32, activation="relu")(x)
 score_output = layers.Dense(
     latent_dim, activation="linear", name="log_gradient_output"
 )(x)
+
 score_model = keras.Model(
-    inputs=[xt_inputs, time_inputs], outputs=score_output, name="score_model"
+    inputs=[xt_inputs, time_inputs],
+    outputs=score_output,
+    name="transformer_score_model_corrected",
 )
+
+# Display the model summary
 score_model.summary()
 
 
 class Vibes(keras.Model):
     def __init__(
-        self, word_encoder, score_model, batch_size, maxlen=80, dt=0.001, **kwargs
+        self, word_encoder, score_model, batch_size, maxlen, latent_dim, dt, **kwargs
     ):
         super().__init__(**kwargs)
         self.word_encoder = word_encoder
         self.score_fn = score_model
+
         self.batch_size = batch_size
+        self.latent_dim = latent_dim
         self.maxlen = maxlen
         self.dt = dt
 
@@ -91,7 +164,7 @@ class Vibes(keras.Model):
 
         mask = tf.reshape(mask, (self.maxlen, 1, 1))
         mask = tf.cast(mask, tf.float32)
-        mask = tf.tile(mask, [1, batch_size, latent_dim])
+        mask = tf.tile(mask, [1, batch_size, self.latent_dim])
         output_tensor = input_tensor_tr * mask
         return output_tensor
 
@@ -123,11 +196,9 @@ class Vibes(keras.Model):
         diagonal = tf.gather_nd(xt, indices)
         return diagonal
 
-    def vectorized_masking(
-        self, embeddings_tr, batch_size, latent_dim, maxlen, include=True
-    ):
-        indices = tf.range(maxlen)
-        time_steps = tf.expand_dims(tf.range(maxlen), axis=1)
+    def vectorized_masking(self, embeddings_tr, batch_size, include=True):
+        indices = tf.range(self.maxlen)
+        time_steps = tf.expand_dims(tf.range(self.maxlen), axis=1)
 
         if include:
             masks = tf.less(indices, time_steps)
@@ -137,10 +208,10 @@ class Vibes(keras.Model):
         masks = tf.cast(masks, tf.float32)
         masks = tf.expand_dims(masks, axis=2)
         masks = tf.expand_dims(masks, axis=3)
-        masks = tf.tile(masks, [1, 1, batch_size, latent_dim])
+        masks = tf.tile(masks, [1, 1, batch_size, self.latent_dim])
 
         embeddings_expanded = tf.expand_dims(embeddings_tr, axis=0)
-        embeddings_expanded = tf.tile(embeddings_expanded, [maxlen, 1, 1, 1])
+        embeddings_expanded = tf.tile(embeddings_expanded, [self.maxlen, 1, 1, 1])
 
         masked_embeddings = embeddings_expanded * masks
         return masked_embeddings
@@ -156,7 +227,7 @@ class Vibes(keras.Model):
         score_norm = tf.norm(score)
 
         dW = tf.random.normal(
-            shape=(self.maxlen * batch_size, latent_dim),
+            shape=(self.maxlen * batch_size, self.latent_dim),
             mean=0.0,
             stddev=tf.sqrt(self.dt),
         )
@@ -169,12 +240,12 @@ class Vibes(keras.Model):
             lambda args: self.update_slice_by_gather(dx, args[0], args[1], batch_size),
             elems=(xt, indexes),
             fn_output_signature=tf.TensorSpec(
-                shape=(None, latent_dim), dtype=tf.float32
+                shape=(None, self.latent_dim), dtype=tf.float32
             ),
         )
 
         predictions = tf.reshape(
-            xt_updated, (self.maxlen, self.maxlen, batch_size, latent_dim)
+            xt_updated, (self.maxlen, self.maxlen, batch_size, self.latent_dim)
         )
         predictions = self.gather_diagonal_slices(predictions)
 
@@ -187,16 +258,17 @@ class Vibes(keras.Model):
         embeddings_tr = tf.transpose(embeddings, perm=[1, 0, 2])
 
         embeddings_tr_tiled = self.vectorized_masking(
-            embeddings_tr, batch_size=batch_size, latent_dim=latent_dim, maxlen=maxlen
+            embeddings_tr, batch_size=batch_size
         )
 
         score_input = tf.reshape(
-            embeddings_tr_tiled, (self.maxlen, self.maxlen * batch_size, latent_dim)
+            embeddings_tr_tiled,
+            (self.maxlen, self.maxlen * batch_size, self.latent_dim),
         )
         score_input = tf.transpose(score_input, perm=[1, 0, 2])
 
         embeddings_tr_tiled_with_target = self.vectorized_masking(
-            embeddings_tr, batch_size=batch_size, latent_dim=latent_dim, maxlen=maxlen
+            embeddings_tr, batch_size=batch_size
         )
         labels = self.gather_diagonal_slices(embeddings_tr_tiled_with_target)
 
@@ -206,7 +278,7 @@ class Vibes(keras.Model):
         initial_state = (score_input, labels, step_loss, batch_size)
         xt, _, error, _ = tf.scan(self.diffusion, steps, initializer=initial_state)
 
-        xt = tf.reshape(xt[-1], (self.maxlen, self.maxlen, batch_size, latent_dim))
+        xt = tf.reshape(xt[-1], (self.maxlen, self.maxlen, batch_size, self.latent_dim))
         xt = self.gather_diagonal_slices(xt)
         xt = tf.transpose(xt, perm=[1, 0, 2])
 
@@ -224,15 +296,15 @@ class Vibes(keras.Model):
         score_norm = tf.norm(score)
 
         dW = tf.random.normal(
-            shape=(batch_size, latent_dim), mean=0.0, stddev=tf.sqrt(self.dt)
+            shape=(batch_size, self.latent_dim), mean=0.0, stddev=tf.sqrt(self.dt)
         )
         dx = (0.5 * score * self.dt) + (score_norm * dW)
 
         xt = tf.transpose(xt, perm=[1, 0, 2])
-        xt = tf.reshape(xt, (batch_size * self.maxlen, embedding_dim))
+        xt = tf.reshape(xt, (batch_size * self.maxlen, self.latent_dim))
 
         xt_updated = self.update_slice_by_tile(dx, xt, target_step, batch_size)
-        xt_updated = tf.reshape(xt_updated, (self.maxlen, batch_size, embedding_dim))
+        xt_updated = tf.reshape(xt_updated, (self.maxlen, batch_size, self.latent_dim))
         return (xt_updated, target_step, batch_size)
 
     def geretate_step(self, state, index):
@@ -248,7 +320,7 @@ class Vibes(keras.Model):
         return (embeddings_tr_final, batch_size)
 
     def diffusion_generate(self, embeddings_tr, batch_size, start_index):
-        indexes = tf.range(start=start_index, limit=maxlen)
+        indexes = tf.range(start=start_index, limit=self.maxlen)
 
         initial_state = (embeddings_tr, batch_size)
         updated_embeddings_tr, _ = tf.scan(self.geretate_step, indexes, initial_state)
@@ -260,24 +332,7 @@ class Vibes(keras.Model):
     def train_step(self, data):
 
         with tf.GradientTape() as tape:
-            transposed_data = tf.transpose(data, perm=[1, 0])
-
-            embeddings = tf.map_fn(
-                fn=self.apply_word_encoder,
-                elems=transposed_data,
-                dtype=tf.float32,
-                parallel_iterations=10,
-            )
-
-            embeddings = tf.squeeze(embeddings, axis=2)
-            embeddings = tf.transpose(embeddings, perm=[1, 0, 2])
-
-            print('embeddings map fn: ', embeddings)
-            
-            all_embeddings = self.word_encoder(data)
-            
-            print('all_embeddings: ', all_embeddings)
-            exit()
+            embeddings = self.word_encoder(data)
 
             _, step_loss, sequence_loss = self.diffusion_loss(
                 embeddings, batch_size=self.batch_size
