@@ -10,9 +10,7 @@ from textGenerator import TextGenerator
 
 from gloveEmbeddings import (
     prepare_lm_tokens,
-    # prepare_lm_tokens_words,
     word_to_index,
-    sentences,
     text_ds,
     vocab,
 )

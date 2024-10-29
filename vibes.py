@@ -119,8 +119,6 @@ score_model = keras.Model(
     outputs=score_output,
     name="transformer_score_model_corrected",
 )
-
-# Display the model summary
 score_model.summary()
 
 
