@@ -42,17 +42,28 @@ class TextGenerator(keras.callbacks.Callback):
             # Step 1: Start with the initial tokens
             generated_tokens = self.start_tokens.copy()
 
-            # Step 2: Pad the tokens to max_tokens if necessary
-            if len(generated_tokens) < self.max_tokens:
-                padding_length = self.max_tokens - len(generated_tokens)
-                generated_tokens += [self.pad_token] * padding_length
-            else:
+            # Step 2: Truncate tokens if necessary
+            if len(generated_tokens) > self.max_tokens:
                 generated_tokens = generated_tokens[: self.max_tokens]
 
             # Step 3: Generate embeddings for the input tokens
             input_tokens = tf.convert_to_tensor([generated_tokens], dtype=tf.int32)
             embeddings = self.model.word_encoder.predict(input_tokens, verbose=0)
-            embeddings_tr = tf.transpose(embeddings, perm=[1, 0, 2])
+
+            # Step 3: Pad with zeros up to maxlen
+            current_len = tf.shape(input_tokens)[1]
+            padding_len = self.max_tokens - current_len
+            paddings = tf.stack(
+                [
+                    tf.constant([0, 0], dtype=tf.int32),
+                    tf.stack([tf.constant(0, dtype=tf.int32), padding_len]),
+                    tf.constant([0, 0], dtype=tf.int32),
+                ]
+            )
+            padded_embeddings = tf.pad(
+                embeddings, paddings, mode="CONSTANT", constant_values=0.0
+            )
+            embeddings_tr = tf.transpose(padded_embeddings, perm=[1, 0, 2])
 
             # Step 4: Perform diffusion to generate new embeddings
             sequence = self.model.diffusion_generate(
