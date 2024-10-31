@@ -21,7 +21,7 @@ dt = 0.01
 # training
 epochs = 100
 batch_size = 8
-learning_rate = 0.001
+learning_rate = 0.0001
 
 # transformer block
 num_heads = 8  # Number of attention heads
@@ -30,4 +30,4 @@ num_layers = 4  # Number of Transformer Encoder layers
 
 # inference
 start_prompt = "this movie is"
-print_every_batch = 1
+print_every_batch = 100

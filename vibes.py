@@ -3,7 +3,10 @@ import os
 os.environ["KERAS_BACKEND"] = "tensorflow"
 
 import keras
+import numpy as np
+import tensorflow as tf
 from keras import layers, losses
+import numpy as np
 import tensorflow as tf
 from gloveEmbeddings import embedding_layer
 
@@ -194,6 +197,7 @@ class Vibes(keras.Model):
         diagonal = tf.gather_nd(xt, indices)
         return diagonal
 
+    # requires input shape (steps, batch_size, features)
     def vectorized_masking(self, embeddings_tr, batch_size, include=True):
         indices = tf.range(self.maxlen)
         time_steps = tf.expand_dims(tf.range(self.maxlen), axis=1)
@@ -245,6 +249,7 @@ class Vibes(keras.Model):
         predictions = tf.reshape(
             xt_updated, (self.maxlen, self.maxlen, batch_size, self.latent_dim)
         )
+
         predictions = self.gather_diagonal_slices(predictions)
 
         error += losses.mean_squared_error(labels, predictions)
@@ -266,7 +271,7 @@ class Vibes(keras.Model):
         score_input = tf.transpose(score_input, perm=[1, 0, 2])
 
         embeddings_tr_tiled_with_target = self.vectorized_masking(
-            embeddings_tr, batch_size=batch_size
+            embeddings_tr, batch_size=batch_size, include=False
         )
         labels = self.gather_diagonal_slices(embeddings_tr_tiled_with_target)
 
