@@ -16,12 +16,12 @@ latent_dim = 100  # Embedding dimensions
 maxlen = 25  # Max sequence length
 
 # diffusion
-dt = 0.01
+dt = 0.05
 
 # training
 epochs = 100
-batch_size = 8
-learning_rate = 0.0001
+batch_size = 24
+learning_rate = 0.001
 
 # transformer block
 num_heads = 8  # Number of attention heads
@@ -30,4 +30,4 @@ num_layers = 4  # Number of Transformer Encoder layers
 
 # inference
 start_prompt = "this movie is"
-print_every_batch = 100
+print_every_batch = 10

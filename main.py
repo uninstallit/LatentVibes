@@ -10,7 +10,9 @@ from textGenerator import TextGenerator
 
 from gloveEmbeddings import (
     prepare_lm_tokens,
+    # prepare_lm_tokens_words,
     word_to_index,
+    sentences,
     text_ds,
     vocab,
 )
@@ -41,7 +43,9 @@ vae = Vibes(
     latent_dim=latent_dim,
     dt=dt,
 )
-vae.compile(optimizer=keras.optimizers.Adam(learning_rate=learning_rate))
+vae.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=learning_rate)  # , run_eagerly=True
+)
 
 start_tokens = [word_to_index.get(_, 1) for _ in start_prompt.split()]
 text_gen_callback = TextGenerator(start_tokens, maxlen, vocab, print_every_batch)

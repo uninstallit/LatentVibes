@@ -8,7 +8,7 @@ from vibesConfig import (
     vocab_size,
     latent_dim,
     maxlen,
-    UNK_TOKEN
+    UNK_TOKEN,
 )
 
 import os
@@ -68,7 +68,7 @@ embedding_matrix = np.zeros((num_tokens, latent_dim))
 
 for word, i in word_index.items():
     if word == UNK_TOKEN:
-        embedding_matrix[i] = np.zeros(latent_dim)
+        embedding_matrix[i] = np.random.uniform(-1.0, 1.0, latent_dim)
         misses += 1
     else:
         embedding_vector = embeddings_index.get(word)
@@ -76,14 +76,17 @@ for word, i in word_index.items():
             embedding_matrix[i] = embedding_vector
             hits += 1
         else:
-            embedding_matrix[i] = np.zeros(latent_dim)
+            embedding_matrix[i] = np.random.uniform(-1.0, 1.0, latent_dim)
             misses += 1  # OOV words other than [UNK]
 
 print("\nConverted %d words (%d misses)" % (hits, misses))
 
 embedding_layer = layers.Embedding(
-    num_tokens, latent_dim, trainable=True, name="embedding"
+    num_tokens, latent_dim, trainable=True, weights=embedding_matrix, name="embedding"
 )
 
-embedding_layer.build((1,))
-embedding_layer.set_weights([embedding_matrix])
+# print("initial embe matrix 0: ", embedding_matrix[0])
+# print("initial embe matrix 0: ", embedding_matrix[1])
+
+# embedding_layer.build((1,))
+# embedding_layer.set_weights([embedding_matrix])
