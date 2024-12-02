@@ -19,15 +19,17 @@ maxlen = 25  # Max sequence length
 dt = 0.05
 
 # training
-epochs = 100
-batch_size = 24
+epochs = 1000
+batch_size = 64
 learning_rate = 0.001
 
-# transformer block
-num_heads = 8  # Number of attention heads
-ff_dim = 128  # Feed-Forward Network dimension
-num_layers = 4  # Number of Transformer Encoder layers
+# Transformer parameters
+num_transformer_blocks = 4
+head_size = 64
+num_heads = 4
+ff_dim = 128
+dropout = 0.1
 
 # inference
 start_prompt = "this movie is"
-print_every_batch = 10
+print_every_batch = 500

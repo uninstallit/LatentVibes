@@ -5,14 +5,15 @@ os.environ["KERAS_BACKEND"] = "tensorflow"
 import tensorflow.data as tf_data
 
 import keras
-from vibes import word_encoder, score_model, Vibes
+from vibes import word_encoder, Vibes
 from textGenerator import TextGenerator
+
+# from models.transformer import score_model
+from models.vanilla import score_model
 
 from gloveEmbeddings import (
     prepare_lm_tokens,
-    # prepare_lm_tokens_words,
     word_to_index,
-    sentences,
     text_ds,
     vocab,
 )
